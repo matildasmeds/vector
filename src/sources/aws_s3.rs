@@ -310,40 +310,43 @@ impl SqsIngestor {
 
         match object.body {
             Some(body) => {
-                let stream = FramedRead::new(
-                    body.into_async_read(),
-                    BytesDelimitedCodec::new_with_max_length(b'\n', 100000),
-                )
-                .filter_map(|line| {
-                    let bucket_name = s3_event.s3.bucket.name.clone();
-                    let object_key = s3_event.s3.object.key.clone();
-                    let aws_region = s3_event.aws_region.clone();
-                    let metadata = metadata.clone();
+                let r = self.s3_object_decoder(
+                    &s3_event.s3.object.key,
+                    object.content_type.as_deref(),
+                    body,
+                );
+                let stream =
+                    FramedRead::new(r, BytesDelimitedCodec::new_with_max_length(b'\n', 100000))
+                        .filter_map(|line| {
+                            let bucket_name = s3_event.s3.bucket.name.clone();
+                            let object_key = s3_event.s3.object.key.clone();
+                            let aws_region = s3_event.aws_region.clone();
+                            let metadata = metadata.clone();
 
-                    async move {
-                        match line {
-                            Ok(line) => {
-                                let mut event = Event::from(line);
+                            async move {
+                                match line {
+                                    Ok(line) => {
+                                        let mut event = Event::from(line);
 
-                                let log = event.as_mut_log();
-                                log.insert("bucket", bucket_name);
-                                log.insert("object", object_key);
-                                log.insert("region", aws_region);
+                                        let log = event.as_mut_log();
+                                        log.insert("bucket", bucket_name);
+                                        log.insert("object", object_key);
+                                        log.insert("region", aws_region);
 
-                                for (key, value) in &metadata {
-                                    log.insert(key, value.clone());
+                                        for (key, value) in &metadata {
+                                            log.insert(key, value.clone());
+                                        }
+
+                                        Some(Ok(event))
+                                    }
+                                    Err(err) => {
+                                        // TODO handling IO errors here?
+                                        dbg!(err);
+                                        None
+                                    }
                                 }
-
-                                Some(Ok(event))
                             }
-                            Err(err) => {
-                                // TODO handling IO errors here?
-                                dbg!(err);
-                                None
-                            }
-                        }
-                    }
-                });
+                        });
 
                 out.send_all(Compat::new(Box::pin(stream)))
                     .compat()
@@ -384,6 +387,52 @@ impl SqsIngestor {
             })
             .await
     }
+
+    fn s3_object_decoder(
+        &self,
+        key: &str,
+        content_type: Option<&str>,
+        body: rusoto_s3::StreamingBody,
+    ) -> Box<dyn tokio::io::AsyncRead + Send + Unpin> {
+        use async_compression::tokio_02::bufread;
+
+        let r = tokio::io::BufReader::new(body.into_async_read());
+
+        use Compression::*;
+        match self.compression {
+            Auto => unimplemented!(),
+            None => Box::new(r),
+            Gzip => Box::new(bufread::GzipDecoder::new(r)),
+            Lz4 => unimplemented!(),
+            Snappy => unimplemented!(),
+            Zstd => Box::new(bufread::ZstdDecoder::new(r)),
+        }
+    }
+}
+
+fn content_type_to_compression(content_type: &str) -> Option<Compression> {
+    use Compression::*;
+    match content_type {
+        "application/gzip" => Some(Gzip),
+        "application/zstd" => Some(Zstd),
+        "application/x-snappy-framed" => Some(Snappy),
+        _ => Option::None,
+    }
+}
+
+fn object_key_to_compression(key: &str) -> Option<Compression> {
+    let extension = std::path::Path::new(key)
+        .extension()
+        .and_then(std::ffi::OsStr::to_str);
+
+    use Compression::*;
+    extension.and_then(|extension| match extension {
+        "gz" => Gzip,
+        "zst" => Zstd,
+        "lz4" => Lz4,
+        "sz" => Snappy,
+        _ => None,
+    })
 }
 
 // https://docs.aws.amazon.com/AmazonS3/latest/dev/notification-content-structure.html
