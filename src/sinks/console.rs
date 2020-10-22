@@ -2,7 +2,7 @@ use crate::{
     buffers::Acker,
     config::{DataType, GenerateConfig, SinkConfig, SinkContext, SinkDescription},
     event::Event,
-    internal_events::ConsoleFieldNotFound,
+    internal_events::{ConsoleEventReceived, ConsoleFieldNotFound},
     sinks::util::{
         encoding::{EncodingConfig, EncodingConfiguration},
         StreamSink,
@@ -142,7 +142,11 @@ impl StreamSink for WriterSink {
                     // so stop the sink.
                     error!("Error writing to output: {}. Stopping sink.", error);
                     return Err(());
-                }
+                };
+
+                emit!(ConsoleEventReceived, {
+                    byte_size: buf.len(),
+                });
             }
         }
         Ok(())
